@@ -73,3 +73,9 @@ How do you check if it worked? Reconstruct the experts, plug them back in, run a
 This is cheap to test. You don't have to train an LLM. Just an open-weights MoE, some compute to fit a hypernetwork, and a benchmark. Someone with a GPU and a weekend could do it.
 
 That's the proposal.
+
+Okay, so in retrospect, maybe its naive to think centroid to hypernetwork weights could work. Maybe even thinking this approach would work without conventional knowledge distillation is naive in general. However, I think that even trying to find alternative solutions is a worthy puruit. 
+
+Another simpler option seems possible to explore. Firstly, I think constraining the final layer weights of the networks produced by the hypernetwork, to be nearby each other, might enforce the manifold deviation hypothesis I proposed earlier. Traditional knowledge distillation with this in mind, might produce meaningful results on its own; without any additional tricks except this proposed auxilary loss.
+
+I've got some sparse mixture of experts weights readily available. I do wonder what interpolation would be like between latent experts, or for top K latent experts. That might enable some interesting properties. Hmm.
