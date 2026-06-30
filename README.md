@@ -79,6 +79,8 @@ To exploit the nature of this strategy even further, Q's can be stacked via addi
 
 Additionally, the hypernetworks can be exploited as a sparse mixture of latent experts. Whereby Z's Top KNN centroid vectors, can be routed to QE & VE. Their outputs, aggregated in a final summation, as similarity weighted expert outputs.
 
+In new environments, an additional H module is inserted with real time data to perform few shot learning. In these setups, this new H is known as Short Term Memory, and the prior H is, is known as Long Term Memory.
+
 
 ## Proposal: Distilling Into Weights Instead of Probabilities
 Here's something I haven't built yet, but I think it's the right next step.
