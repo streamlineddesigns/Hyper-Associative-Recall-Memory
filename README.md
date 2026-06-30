@@ -79,3 +79,6 @@ Okay, so in retrospect, maybe its naive to think centroid to hypernetwork weight
 Another simpler option seems possible to explore. Firstly, I think constraining the final layer weights of the networks produced by the hypernetwork, to be nearby each other, might enforce the manifold deviation hypothesis I proposed earlier. Traditional knowledge distillation with this in mind, might produce meaningful results on its own; without any additional tricks except this proposed auxilary loss.
 
 I've got some sparse mixture of experts weights readily available. I do wonder what interpolation would be like between latent experts, or for top K latent experts. That might enable some interesting properties. Hmm.
+
+### Original Diagram
+![Descriptive Alt Text](./original-diagram.png)
