@@ -69,7 +69,7 @@ Q gets constrained to a nearby locality as K. Its used to make Q:K similarity pr
 
 K is produced as a simple identity function from Z. (K,a) gets inserted into H if its 1NN is less than a similarity threshold. Whereby (a) represents the action estimations.
 
-At intersection Q,K and H, Q queries H for its KNN K's and produces a gram kernel matrix via cosine similarity, which is then normalized. This normalized query kernel represents the learned weights of Q in relationship to its KNN K's. However, it's not simply the KNN K's whose weighting is learned. It's also K's associated action estimations or (a), whose weighting is learned.
+At intersection Q,K and H, Q queries H for its KNN K's (its support set) and produces a gram kernel matrix via cosine similarity, which is then normalized. This normalized query kernel represents the learned weights of Q in relationship to its KNN K's. However, it's not simply the KNN K's whose weighting is learned. It's also K's associated action estimations or (a), whose weighting is learned.
 
 M is then produced as the summation of similarity weighted action estimations.
 
