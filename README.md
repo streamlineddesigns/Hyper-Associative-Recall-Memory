@@ -59,7 +59,7 @@ E gets trained to produce Z on raw observations in a supervised fashion, while p
 
 Z is a latent representation of raw observations.
 
-VE(hypernetwork) gets conditioned on the 1NN centroid vector of Z to produce its target network. An LSTM process's actions, & velocity at time step t-t+n. A ResNet CNN process's last N frames raw observations. The output of the LSTM & CNN get concatenated into a contextualized vector of Z, lets call it Z'v, not to be mistaken with V. 
+VE(hypernetwork) gets conditioned on the 1NN centroid vector of Z to produce its target network. An LSTM process's actions, & velocity at time step t-t+n. A ResNet CNN process's last N frames raw observations. The output of the LSTM & CNN get concatenated into a contextualized vector of Z, lets call it Z'v. 
 
 V is the final output of the VE branch. The target network of VE consumes Z'v and produces V. V is the size of output dimensions and is used to make observation:action predictions.
 
