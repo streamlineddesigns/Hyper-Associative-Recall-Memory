@@ -1,5 +1,5 @@
 #---------------------------------------------------------
-#   Copyright 2026 Pierce Prange
+#   Copyright 2026 @Streamlined Designs
 #
 #   Licensed under the Apache License, Version 2.0 (the "License");
 #   you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras import regularizers
 import numpy as np
 from sklearn.model_selection import train_test_split
+import os
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -55,6 +56,8 @@ print("Loading Datasets...")
 mnist_half = mnist_x_train[:len(mnist_x_train)//2]
 fashion_half = fashion_x_train[:len(fashion_x_train)//2]
 X_full = fashion_x_train#Only Fashion-MNIST for now#np.concatenate((mnist_half, fashion_half), axis=0)
+#X_full = np.concatenate((mnist_half, fashion_half), axis=0)
+
 
 # Normalize
 X = X_full.reshape(X_full.shape[0], 28, 28, 1).astype('float32') / 255.0
@@ -62,6 +65,10 @@ Y_dummy = np.zeros((X.shape[0], 1))
 
 X_train, X_test, y_train, y_test = train_test_split(X, Y_dummy, test_size=0.2)
 print(f"Hybrid Dataset Size: {X_train.shape}")
+
+#model save strings
+SAVE_FULL_MODEL_DIR = "saved_cnnae_model_dir"  # <--- Define once
+SAVE_ENCODER_DIR = "saved_cnne_model_dir"
 
 # ---------------------------------------------------------
 # DATA AUGMENTATION PIPELINE
@@ -265,6 +272,25 @@ hybrid_ae = ContrastiveAutoEncoder(
 hybrid_ae.compile(optimizer=Adam(learning_rate=LEARNING_RATE))
 
 # ---------------------------------------------------------
+# CHECK FOR EXISTING MODEL TO RESUME
+# ---------------------------------------------------------
+# We look for the 'variables' folder inside the SavedModel directory
+variables_path = os.path.join(SAVE_FULL_MODEL_DIR, 'variables', 'variables')
+
+if os.path.exists(variables_path + '.index'):
+    print(f"\n[RESUME MODE] Existing model found at '{SAVE_FULL_MODEL_DIR}'.")
+    print("Loading weights from existing SavedModel variables...")
+    try:
+        # Load weights from the checkpoint inside the SavedModel dir
+        hybrid_ae.load_weights(variables_path)
+        print("Weights loaded successfully. Continuing training...")
+    except Exception as e:
+        print(f"Warning: Could not load weights ({e}). Starting from scratch.")
+else:
+    print("\n[NEW TRAINING] No existing model found. Starting from scratch...")
+
+
+# ---------------------------------------------------------
 # TRAINING WITH CALLBACKS
 # ---------------------------------------------------------
 print("\nStarting Training...")
@@ -276,7 +302,7 @@ print("Using tf.data pipeline with dual-view augmentation")
 # Early Stopping: Monitor Validation Loss
 early_stop = keras.callbacks.EarlyStopping(
     monitor='val_loss', 
-    patience=3,
+    patience=4,
     restore_best_weights=True,
     verbose=1
 )
@@ -301,8 +327,9 @@ history = hybrid_ae.fit(
 # EXPORT
 # ---------------------------------------------------------
 print("\nSaving Models...")
-tf.saved_model.save(hybrid_ae, "saved_cnnae_model_dir")
-tf.saved_model.save(hybrid_ae.encoder, "saved_cnne_model_dir")
+# This overwrites the directory we potentially loaded from, updating it with new weights
+tf.saved_model.save(hybrid_ae, SAVE_FULL_MODEL_DIR) 
+tf.saved_model.save(hybrid_ae.encoder, SAVE_ENCODER_DIR)
 print("Done.")
 
 # ---------------------------------------------------------
