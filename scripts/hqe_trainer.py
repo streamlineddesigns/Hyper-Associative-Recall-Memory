@@ -1007,12 +1007,12 @@ class MultiHopHyperRetriever(Model):
 
         if instance.use_ve_branches:
             instance.ve_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.target_dim),
+                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.output_dim),
                 hop_id=i
             ) for i in range(instance.num_hops)]
             instance.ve_hop_target_nets = [DynamicTargetNetwork(
                 arch_list=instance.hyper_arch,
-                output_dim=instance.target_dim,
+                output_dim=instance.output_dim,
                 hop_id=i
             ) for i in range(instance.num_hops)]
         
@@ -1627,7 +1627,7 @@ frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
 
 # *** FIXED: Initialize MEM_BANK_VECS placeholder with enough vectors for top_k ***
 # Must have at least NUM_NEIGHBORS vectors to avoid TopKV2 error during dummy pass
-MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32))
+MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
 MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32)) # Changed from LABELS
 
 # Always build fresh architecture first (for fallback)
@@ -1858,7 +1858,7 @@ if LTM_EXISTS and existing_count > 0:
 
 else:
     SHOULD_SEED = True
-    MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32))
+    MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
     MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32))
 
 # *** NEW: Use HQE for LTM Encoding if Available ***
@@ -2933,7 +2933,7 @@ if USING_STM and len(candidate_vectors) > 0:
     
 else:
     stm_vecs_final = np.empty((0, EMBEDDING_DIM))
-    stm_protos_final = np.empty((0, EMBEDDING_DIM))
+    stm_protos_final = np.empty((0, PROTOTYPE_DIM))
     print(">>> No STM Optimization Performed.")
 
 # === STM FINAL STATE DEBUG ===
