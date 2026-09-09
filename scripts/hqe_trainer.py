@@ -78,7 +78,6 @@ STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 
 # Model Paths (Unified Weights Only)
 ENCODER_PATH = "./saved_cnne_model_dir"
-VALUE_ENC_PATH = "./saved_mnist_classifier_dir" 
 # *** UPDATED: Single .keras weights file + Full model ***
 SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.keras"
 SAVE_PATH_HQE_FULL = "./saved_hqe_hyper_multi_hop_full.keras"
@@ -804,7 +803,7 @@ def get_target_params_count(input_dim, arch_list, output_dim):
     count += prev * output_dim + output_dim
     return count
 
-TOTAL_PARAMS_PER_HOP = get_target_params_count(EMBEDDING_DIM, TARGET_NET_ARCH, EMBEDDING_DIM)
+TOTAL_PARAMS_PER_HOP = get_target_params_count(EMBEDDING_DIM, TARGET_NET_ARCH, PROTOTYPE_DIM)
 
 
 class CentroidHypernetwork(keras.Model):
@@ -1188,7 +1187,7 @@ class MultiHopHyperRetriever(Model):
 
 class GuidedSystem(Model):
     """Full system with Data Augmentation (From Script A)"""
-    def __init__(self, retriever, value_encoder_path):
+    def __init__(self, retriever):
         super().__init__()
         self.retriever = retriever
         
@@ -1201,12 +1200,7 @@ class GuidedSystem(Model):
             ],
             name="data_augmentation"
         )
-        
-        print(f"Loading Value Encoder from {value_encoder_path}...")
-        self.value_encoder = models.load_model(value_encoder_path)
-        self.value_encoder.trainable = False 
-        print("Value Encoder Loaded & Frozen.")
-        
+                
     def call(self, inputs, training=None, **kwargs):
         if training:
             inputs = self.data_augmentation(inputs, training=True)
@@ -1344,10 +1338,10 @@ def verify_model_loading(model, model_name="HQE"):
         print(f"  Input shape: {test_input.shape}")
         print(f"  Output shape: {output.shape}")
         
-        if output.shape == (2, EMBEDDING_DIM): # Updated for Prototypes
+        if output.shape == (2, PROTOTYPE_DIM): # Updated for Prototypes
             print(f"  ✓ Output shape correct")
         else:
-            print(f"  ✗ Output shape incorrect! Expected (2, {EMBEDDING_DIM})")
+            print(f"  ✗ Output shape incorrect! Expected (2, {PROTOTYPE_DIM})")
             verification_passed = False
             issues_found.append(f"Output shape mismatch: {output.shape}")
         
@@ -2275,7 +2269,7 @@ print(f"LTM Loaded: {len(db_vecs_raw)} vectors (Max: {LTM_MAX_CAPACITY})")
 # ---------------------------------------------------------
 # 8. Compile
 # ---------------------------------------------------------
-system_model = GuidedSystem(retriever_branch, VALUE_ENC_PATH)
+system_model = GuidedSystem(retriever_branch)
 
 # ---------------------------------------------------------
 # *** NEW: Custom Prototype Accuracy Metric ***
@@ -3040,7 +3034,6 @@ if total_wrong_p1 > 0:
     print(f"Recovery Rate: {recovery_rate:.2%} of previous errors fixed by Optimized STM")
 
 print(f"\nFinal Accuracy Comparison:")
-print(f"Value Encoder (Baseline)      : {acc_ve:.4f}")
 print(f"Multi-Hop Hyper Pass 1 (No STM): {acc_pass1:.4f}")
 print(f"Multi-Hop Hyper Pass 3 (Opt STM): {acc_pass3:.4f}")
 
