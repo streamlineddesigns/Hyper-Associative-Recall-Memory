@@ -22,6 +22,8 @@
 # No Duplicate ID Warnings
 # STM Database Vacuum/Cleanup
 # Learning Rate Persistence (Optimizer State Saved)
+# Hyperspherical Prototypes
+# Prototype Mapping LUT (Dataset -> Class -> Prototype)
 # ---------------------------------------------------------
 
 # ---------------------------------------------------------
@@ -85,6 +87,15 @@ SAVE_PATH_HQE_CONFIG = "./saved_hqe_hyper_multi_hop_config.json"
 # *** NEW: Visual Centroids Path ***
 SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
 
+# *** NEW: Hyperspherical Prototype Config ***
+PROTOTYPE_COUNT = 100               # Total pool of prototypes on hypersphere
+PROTOTYPE_DIM = 128                 # Must match EMBEDDING_DIM
+PROTOTYPE_SAVE_PATH = "./saved_hyperspherical_prototypes.npy"
+PROTOTYPE_LUT_PATH = "./prototype_mapping_lut.json"
+PROTOTYPE_OPTIMIZATION_EPOCHS = 500 # For repulsion optimization
+PROTOTYPE_OPTIMIZATION_LR = 0.01
+CURRENT_DATASET_NAME = "fashion_mnist" # Change per dataset run
+
 # Embedding & Architecture (Script A dims + Script B Hypernetwork)
 EMBEDDING_DIM = 128 
 NUM_NEIGHBORS = 5       
@@ -93,7 +104,7 @@ EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 2
+NUM_HOPS = 1
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -134,7 +145,7 @@ HYBRID_USE_LTM_PROTO = True
 
 # Hypernetwork Config (From Script B)
 NUM_VISUAL_CENTROIDS = 10
-NUM_ACTIONS = 10
+NUM_ACTIONS = 10 # Used for Class Count logic
 TARGET_NET_ARCH = [64, 32]
 HYPER_INTERMEDIATE_DIM = 98
 
@@ -168,7 +179,7 @@ LOG_CONFIDENCE_SCORES = False
 
 # Add this after your CONFIGURATION section:
 GLOBAL_STM_VECS = None
-GLOBAL_STM_LABELS = None
+GLOBAL_STM_PROTOS = None # Changed from LABELS to PROTOS
 
 #Grid Search on the selected hyperparameters
 HYPERPARM_GRID_SEARCH = False
@@ -314,6 +325,119 @@ def vacuum_chroma_database(db_path):
 def generate_unique_id(prefix, counter, timestamp):
     """Generate unique ID that won't conflict with existing IDs"""
     return f"{prefix}_{timestamp}_{counter}"
+
+# ---------------------------------------------------------
+# *** NEW: Hyperspherical Prototype Generation (FIXED) ***
+# ---------------------------------------------------------
+def generate_hyperspherical_prototypes(count, dim, optimization_epochs=500, lr=0.01):
+    """
+    Generates evenly distributed prototypes on a hypersphere using repulsion optimization.
+    """
+    print(f"Generating {count} hyperspherical prototypes (Dim={dim})...")
+    
+    # Initialize random vectors on hypersphere
+    prototypes = tf.Variable(tf.random.normal((count, dim)), dtype=tf.float32, trainable=True)
+    prototypes.assign(tf.nn.l2_normalize(prototypes, axis=1))
+    
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    
+    # Repulsion Loss: Minimize pairwise cosine similarity
+    def repulsion_step():
+        with tf.GradientTape() as tape:
+            tape.watch(prototypes)  # <--- EXPLICITLY WATCH THE VARIABLE
+            # Normalize
+            norm_prots = tf.nn.l2_normalize(prototypes, axis=1)
+            # Cosine Similarity Matrix
+            sim_matrix = tf.matmul(norm_prots, norm_prots, transpose_b=True)
+            # Mask diagonal (self-similarity)
+            mask = 1.0 - tf.eye(count)
+            # Loss: Sum of squared similarities (push apart)
+            loss = tf.reduce_sum((sim_matrix * mask) ** 2)
+        
+        gradients = tape.gradient(loss, [prototypes])
+        optimizer.apply_gradients(zip(gradients, [prototypes]))
+        
+        # Re-normalize after step to ensure hypersphere constraint
+        prototypes.assign(tf.nn.l2_normalize(prototypes, axis=1))
+        return loss
+
+    for i in range(optimization_epochs):
+        loss = repulsion_step()
+        if (i + 1) % 100 == 0:
+            print(f"  Prototype Opt Epoch {i+1}/{optimization_epochs}, Loss: {loss.numpy():.4f}")
+    
+    return prototypes.numpy()
+
+# ---------------------------------------------------------
+# *** NEW: Prototype Mapping Manager (Persistent LUT) ***
+# ---------------------------------------------------------
+class PrototypeMappingManager:
+    def __init__(self, prototype_vectors, lut_path):
+        self.prototype_vectors = prototype_vectors # Shape: (PROTOTYPE_COUNT, EMBEDDING_DIM)
+        self.lut_path = lut_path
+        self.slot_lut = [False] * len(prototype_vectors) # False = Available
+        self.dataset_lut = {} # { dataset_name: { class_idx: prototype_idx } }
+        self.load()
+    
+    def load(self):
+        if os.path.exists(self.lut_path):
+            with open(self.lut_path, 'r') as f:
+                data = json.load(f)
+            self.slot_lut = data.get('slot_lut', [False] * len(self.prototype_vectors))
+            self.dataset_lut = data.get('dataset_lut', {})
+            print(f"Loaded Prototype LUT from {self.lut_path}")
+        else:
+            print("Initialized new Prototype LUT")
+    
+    def save(self):
+        data = {
+            'slot_lut': self.slot_lut,
+            'dataset_lut': self.dataset_lut
+        }
+        with open(self.lut_path, 'w') as f:
+            json.dump(data, f)
+        print(f"Saved Prototype LUT to {self.lut_path}")
+    
+    def get_prototypes_for_dataset(self, dataset_name, num_classes):
+        """
+        Returns: 
+          1. List of prototype vectors for classes 0..num_classes-1
+          2. Mapping dict { class_idx: prototype_idx }
+        """
+        if dataset_name in self.dataset_lut:
+            # Existing dataset
+            class_map = self.dataset_lut[dataset_name]
+            # Ensure keys are integers for lookup later
+            int_class_map = {int(k): v for k, v in class_map.items()}
+            prototypes = [self.prototype_vectors[idx] for idx in int_class_map.values()]
+            return prototypes, int_class_map
+        else:
+            # New dataset: Assign unused prototypes
+            available_indices = [i for i, used in enumerate(self.slot_lut) if not used]
+            if len(available_indices) < num_classes:
+                raise ValueError(f"Not enough unused prototypes! Need {num_classes}, have {len(available_indices)}")
+            
+            new_class_map = {}
+            for cls_idx in range(num_classes):
+                proto_idx = available_indices[cls_idx]
+                self.slot_lut[proto_idx] = True
+                new_class_map[cls_idx] = proto_idx 
+            
+            self.dataset_lut[dataset_name] = {str(k): v for k, v in new_class_map.items()}
+            self.save()
+            
+            prototypes = [self.prototype_vectors[new_class_map[i]] for i in range(num_classes)]
+            return prototypes, new_class_map
+
+    def get_prototype_vector(self, dataset_name, class_idx):
+        """Get specific prototype vector for a class"""
+        if dataset_name not in self.dataset_lut:
+            raise ValueError(f"Dataset {dataset_name} not registered")
+        proto_idx = self.dataset_lut[dataset_name].get(str(class_idx))
+        if proto_idx is None:
+            raise ValueError(f"Class {class_idx} not mapped for {dataset_name}")
+        return self.prototype_vectors[proto_idx]
+
 #---------------------------------------------------------
 #0. GENERATE CARTESIAN PRODUCT (Combinations)
 #---------------------------------------------------------
@@ -321,15 +445,6 @@ def get_hyperparameter_combination(all_params, param_indices, set_index=0, verbo
     """
     Generates the Cartesian product of selected hyperparameters and returns 
     the specific combination at 'set_index'.
-    
-    Args:
-        all_params (dict): All available parameters. Keys are names, Values are lists of options.
-        param_indices (list): List of indices (or keys) indicating which params to include in grid search.
-        set_index (int): Which combination from the grid to select (0 = first combination).
-        verbose (bool): If True, prints the grid summary table.
-        
-    Returns:
-        dict: A dictionary containing the selected parameter values.
     """
     
     # 1. Filter parameters based on indices provided
@@ -454,7 +569,7 @@ X_full = np.concatenate((x_train, x_test), axis=0)
 Y_full = np.concatenate((y_train, y_test), axis=0)
 
 X_processed = X_full.reshape(X_full.shape[0], 28, 28, 1).astype('float32') / 255.0
-Y_onehot = tf.keras.utils.to_categorical(Y_full, NUM_ACTIONS)
+# Y_onehot = tf.keras.utils.to_categorical(Y_full, NUM_ACTIONS) # REMOVED: Using Prototypes
 
 indices = np.arange(len(X_processed))
 
@@ -462,20 +577,56 @@ indices = np.arange(len(X_processed))
 idx_train_val, idx_test, _, _ = train_test_split(indices, Y_full, test_size=0.5, stratify=Y_full)
 
 X_train_val = X_processed[idx_train_val]
-y_train_val_hot = Y_onehot[idx_train_val]
 y_train_val_int = Y_full[idx_train_val]
 source_ids_train_val = idx_train_val.copy()
 
 X_te = X_processed[idx_test]
 y_te_int = Y_full[idx_test]
-y_te_hot = Y_onehot[idx_test]
 
 # Shuffle training data
 shuffle_idx = np.random.permutation(len(X_train_val))
 X_train_val = X_train_val[shuffle_idx]
-y_train_val_hot = y_train_val_hot[shuffle_idx]
 y_train_val_int = y_train_val_int[shuffle_idx]
 source_ids_train_val = source_ids_train_val[shuffle_idx]
+
+# ---------------------------------------------------------
+# 1b. HYPERSPHERICAL PROTOTYPE INITIALIZATION
+# ---------------------------------------------------------
+print("\n_______________________________________________________________________")
+print("Hyperspherical Prototype Initialization")
+print("_______________________________________________________________________")
+
+if os.path.exists(PROTOTYPE_SAVE_PATH):
+    PROTOTYPE_VECTORS = np.load(PROTOTYPE_SAVE_PATH)
+    print(f"Loaded existing prototypes from {PROTOTYPE_SAVE_PATH}")
+else:
+    PROTOTYPE_VECTORS = generate_hyperspherical_prototypes(
+        PROTOTYPE_COUNT, PROTOTYPE_DIM, 
+        PROTOTYPE_OPTIMIZATION_EPOCHS, PROTOTYPE_OPTIMIZATION_LR
+    )
+    np.save(PROTOTYPE_SAVE_PATH, PROTOTYPE_VECTORS)
+    print(f"Saved new prototypes to {PROTOTYPE_SAVE_PATH}")
+
+proto_manager = PrototypeMappingManager(PROTOTYPE_VECTORS, PROTOTYPE_LUT_PATH)
+
+# *** NEW: Map Labels to Prototypes ***
+# Get assigned prototypes for this dataset
+assigned_prototypes, class_map = proto_manager.get_prototypes_for_dataset(
+    CURRENT_DATASET_NAME, NUM_ACTIONS
+)
+assigned_prototypes = np.array(assigned_prototypes).astype('float32')
+
+# Convert Integer Labels to Prototype Vectors
+def labels_to_prototypes(labels_int, proto_lookup):
+    """Converts integer labels to prototype vectors"""
+    proto_vecs = np.zeros((len(labels_int), PROTOTYPE_DIM), dtype=np.float32)
+    for i, label in enumerate(labels_int):
+        proto_vecs[i] = proto_lookup[label]
+    return proto_vecs
+
+# Apply to Train/Val/Test
+Y_train_val_proto = labels_to_prototypes(y_train_val_int, assigned_prototypes)
+Y_te_proto = labels_to_prototypes(y_te_int, assigned_prototypes)
 
 # ---------------------------------------------------------
 # 2. Load Frozen Encoder (Needed for Centroids + LTM Seeding)
@@ -739,18 +890,20 @@ class MultiHopHyperRetriever(Model):
     Multi-Hop with 1:1 CNN + Hypernetwork Per Hop
     Retrieval uses Direct Cosine Similarity (From Script A)
     Learnable Temperature (From Script A)
+    Updated for Hyperspherical Prototypes (Output Dim = EMBEDDING_DIM)
     """
     def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, 
-                 initial_temperature=1.0, saved_learning_rate=None, use_ve_branches=True, ve_output_dim=10):
+                 initial_temperature=1.0, saved_learning_rate=None, use_ve_branches=True):
         super().__init__()
         self.enc = enc
         self.num_hops = num_hops
         self.target_dim = target_dim
         self.hyper_arch = hyper_arch
-        self.output_dim = output_dim
+        self.output_dim = output_dim # Now always EMBEDDING_DIM
         self.initial_temperature = initial_temperature
         self.saved_learning_rate = saved_learning_rate
         self._encoder_set = enc is not None
+        self.use_ve_branches = use_ve_branches
         
         # --- QE Branch (New) ---
         # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
@@ -765,18 +918,16 @@ class MultiHopHyperRetriever(Model):
             hop_id=i
         ) for i in range(num_hops)]
 
-        # --- VE Branch (New) ---
-        self.use_ve_branches = use_ve_branches
-        self.ve_output_dim = ve_output_dim
+        # --- VE Branch (Updated: Output Dim = EMBEDDING_DIM) ---
         if self.use_ve_branches:
             # VE needs separate hypernetworks generating weights for Action Dims
             self.ve_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(target_dim, hyper_arch, ve_output_dim), # <--- VE Output Dim
+                output_param_count=get_target_params_count(target_dim, hyper_arch, target_dim), # <-- Changed to target_dim
                 hop_id=i
             ) for i in range(num_hops)]
             self.ve_hop_target_nets = [DynamicTargetNetwork(
                 arch_list=hyper_arch,
-                output_dim=ve_output_dim, # <--- VE Output Dim (10)
+                output_dim=target_dim, # <-- Changed to target_dim
                 hop_id=i
             ) for i in range(num_hops)]
         
@@ -805,8 +956,7 @@ class MultiHopHyperRetriever(Model):
             'output_dim': self.output_dim,
             'initial_temperature': self.initial_temperature,
             'saved_learning_rate': self.saved_learning_rate,
-            'use_ve_branches': self.use_ve_branches,
-            've_output_dim': self.ve_output_dim
+            'use_ve_branches': self.use_ve_branches
         }
     
     @classmethod
@@ -829,7 +979,6 @@ class MultiHopHyperRetriever(Model):
         instance.enc = None  # Will be replaced after loading
         instance._encoder_set = False  # Track encoder status
         instance.use_ve_branches = config.get('use_ve_branches', True)
-        instance.ve_output_dim = config.get('ve_output_dim', 10)
         
         # Initialize Model base class
         super(MultiHopHyperRetriever, instance).__init__()
@@ -857,12 +1006,12 @@ class MultiHopHyperRetriever(Model):
 
         if instance.use_ve_branches:
             instance.ve_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.ve_output_dim),
+                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.target_dim),
                 hop_id=i
             ) for i in range(instance.num_hops)]
             instance.ve_hop_target_nets = [DynamicTargetNetwork(
                 arch_list=instance.hyper_arch,
-                output_dim=instance.ve_output_dim,
+                output_dim=instance.target_dim,
                 hop_id=i
             ) for i in range(instance.num_hops)]
         
@@ -873,7 +1022,7 @@ class MultiHopHyperRetriever(Model):
         temp = tf.exp(self.log_temp)
         return tf.clip_by_value(temp, MIN_TEMP, MAX_TEMP)
         
-    def call(self, inputs, training=None, stm_vecs=None, stm_labels=None, 
+    def call(self, inputs, training=None, stm_vecs=None, stm_protos=None, 
             return_sim=False, return_intermediate=False, encode_only=False):
         # === STEP 1: Base Encoding ===
         # REMOVED: Don't check encoder during load - Keras may call internally
@@ -885,7 +1034,7 @@ class MultiHopHyperRetriever(Model):
             z_base = tf.zeros((tf.shape(inputs)[0], self.target_dim), dtype=tf.float32)
         
         current_q = z_base
-        current_v = np.zeros(self.ve_output_dim, dtype=np.float32)
+        current_v = tf.zeros((tf.shape(inputs)[0], self.target_dim), dtype=tf.float32)
         intermediate_queries = [z_base]
         hop_data = []
         
@@ -943,6 +1092,7 @@ class MultiHopHyperRetriever(Model):
         
         # === STEP 3: Direct Cosine Similarity Retrieval (From Script A) ===
         # Note: MEM_BANK_VECS will be set during LTM Initialization
+        # MEM_BANK_PROTOTYPES replaces MEM_BANK_LABELS
         main_vecs_norm = tf.nn.l2_normalize(MEM_BANK_VECS, axis=1)
         sim_matrix_main = tf.matmul(final_q, main_vecs_norm, transpose_b=True)
         values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)  
@@ -950,15 +1100,21 @@ class MultiHopHyperRetriever(Model):
         current_temp = self.get_temperature()
         scaled_values_main = values_main / current_temp 
         attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
-        neighbor_labels_main = tf.gather(MEM_BANK_LABELS, indices_main) 
-        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_labels_main, axis=1)
         
+        # Gather Prototype Vectors instead of Labels
+        neighbor_protos_main = tf.gather(MEM_BANK_PROTOTYPES, indices_main) 
+        # Shape: (Batch, K, EMBEDDING_DIM)
+        
+        # Weighted Sum of Prototypes
+        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_protos_main, axis=1)
+        # Shape: (Batch, EMBEDDING_DIM)
+
         pred_final = pred_main
 
         #training only
         if GLOBAL_STM_VECS is not None:
             stm_vecs = GLOBAL_STM_VECS
-            stm_labels = GLOBAL_STM_LABELS
+            stm_protos = GLOBAL_STM_PROTOS
 
         # === STEP 4: STM Retrieval (From Script A) ===
         if stm_vecs is not None and tf.shape(stm_vecs)[0] > 0:
@@ -970,8 +1126,9 @@ class MultiHopHyperRetriever(Model):
             scaled_values_stm = values_stm / current_temp 
             attn_weights_stm = tf.nn.softmax(scaled_values_stm, axis=1)
             
-            neighbor_labels_stm = tf.gather(stm_labels, indices_stm) 
-            pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_labels_stm, axis=1)
+            # Gather STM Prototypes
+            neighbor_protos_stm = tf.gather(stm_protos, indices_stm)
+            pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_protos_stm, axis=1)
 
             ltm_confidence = max_sim_main  # Shape: [batch_size]
             stm_confidence = max_sim_stm  # Shape: [batch_size]
@@ -1006,6 +1163,7 @@ class MultiHopHyperRetriever(Model):
                 pred_final = (ltm_prediction + stm_prediction)
 
         pred_final = (pred_final * 0.25 + ve_output * 0.75)
+        pred_final = tf.nn.l2_normalize(pred_final, axis=1) # Ensure output is on hypersphere
 
         if return_intermediate:
             if return_sim:
@@ -1184,10 +1342,10 @@ def verify_model_loading(model, model_name="HQE"):
         print(f"  Input shape: {test_input.shape}")
         print(f"  Output shape: {output.shape}")
         
-        if output.shape == (2, NUM_ACTIONS):
+        if output.shape == (2, EMBEDDING_DIM): # Updated for Prototypes
             print(f"  ✓ Output shape correct")
         else:
-            print(f"  ✗ Output shape incorrect! Expected (2, {NUM_ACTIONS})")
+            print(f"  ✗ Output shape incorrect! Expected (2, {EMBEDDING_DIM})")
             verification_passed = False
             issues_found.append(f"Output shape mismatch: {output.shape}")
         
@@ -1279,12 +1437,6 @@ def verify_model_loading(model, model_name="HQE"):
         print(f"  ✗ use_ve_branches attribute missing!")
         verification_passed = False
 
-    if hasattr(model, 've_output_dim'):
-        print(f"  ✓ ve_output_dim: {model.ve_output_dim}")
-    else:
-        print(f"  ✗ ve_output_dim attribute missing!")
-        verification_passed = False
-
     # FINAL RESULT
     print(f"\n{'='*60}")
     if verification_passed:
@@ -1321,7 +1473,6 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
         'learning_rate': float(optimizer.learning_rate.numpy()),
         'optimizer_type': type(optimizer).__name__,
         'use_ve_branches': model.use_ve_branches,
-        've_output_dim': model.ve_output_dim,
     }
     
     config_path = filepath.replace('_full.keras', '_config.json')
@@ -1330,8 +1481,6 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     print(f"  ✓ Config saved to {config_path}")
     print(f"  ✓ Learning rate saved: {config['learning_rate']:.9f}")
     print(f"  ✓ use_ve_branches saved: {config['use_ve_branches']}")  # Debug
-    print(f"  ✓ ve_output_dim saved: {config['ve_output_dim']}")      # Debug
-
     
     # 2. Save model weights
     weights_path = filepath.replace('_full.keras', '_weights.keras')
@@ -1395,7 +1544,6 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
                     loaded_lr = config.get('learning_rate', LEARNING_RATE)
                     print(f"  ✓ Learning rate loaded: {loaded_lr:.9f}")
                     print(f"  ✓ use_ve_branches loaded: {config.get('use_ve_branches', True)}")
-                    print(f"  ✓ ve_output_dim loaded: {config.get('ve_output_dim', 10)}")
                 
                 # Load optimizer state if available
                 optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
@@ -1435,10 +1583,8 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
             print(f"  ✓ Learning rate loaded: {loaded_lr:.9f}")
 
             use_ve_from_config = config.get('use_ve_branches', True)
-            ve_output_dim_from_config = config.get('ve_output_dim', NUM_ACTIONS)
             
             print(f"  ✓ use_ve_branches from config: {use_ve_from_config}")
-            print(f"  ✓ ve_output_dim from config: {ve_output_dim_from_config}")
 
             
             # Rebuild model with encoder
@@ -1451,7 +1597,6 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
                 initial_temperature=config['initial_temperature'],
                 saved_learning_rate=loaded_lr,
                 use_ve_branches=use_ve_from_config, # <--- Force VE branches on
-                ve_output_dim=ve_output_dim_from_config  # <--- Pass action dim
             )
             
             # Build variables with dummy pass
@@ -1487,7 +1632,7 @@ frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
 # *** FIXED: Initialize MEM_BANK_VECS placeholder with enough vectors for top_k ***
 # Must have at least NUM_NEIGHBORS vectors to avoid TopKV2 error during dummy pass
 MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
-MEM_BANK_LABELS = tf.constant(np.zeros((NUM_NEIGHBORS, NUM_ACTIONS), dtype=np.float32))
+MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32)) # Changed from LABELS
 
 # Always build fresh architecture first (for fallback)
 retriever_branch = MultiHopHyperRetriever(
@@ -1636,7 +1781,7 @@ if USING_STM:
         existing_stm_count = 0
     
     stm_vecs_list = []   
-    stm_labels_list = [] 
+    stm_protos_list = [] # Changed from LABELS
 else:
     stm_collection = None
     existing_stm_count = 0
@@ -1644,10 +1789,10 @@ else:
 if USING_STM and existing_stm_count > 0:
     stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
     GLOBAL_STM_VECS = np.array(stm_results['embeddings']).astype('float32')
-    GLOBAL_STM_LABELS = []
+    GLOBAL_STM_PROTOS = []
     for m in stm_results['metadatas']:
-        GLOBAL_STM_LABELS.append(ast.literal_eval(m['one_hot_vector']))
-    GLOBAL_STM_LABELS = np.array(GLOBAL_STM_LABELS).astype('float32')
+        GLOBAL_STM_PROTOS.append(json.loads(m['prototype_vector']))  # parse json string
+    GLOBAL_STM_PROTOS = np.array(GLOBAL_STM_PROTOS).astype('float32')
     print(f"\n✓ STM loaded for training: {len(GLOBAL_STM_VECS)} vectors")
 
 # ---------------------------------------------------------
@@ -1687,16 +1832,16 @@ if LTM_EXISTS and existing_count > 0:
     results = collection.get(include=['embeddings', 'metadatas'])
     db_vecs_raw = np.array(results['embeddings']).astype('float32')
     
-    db_labels_raw = []
+    db_protos_raw = []
     for m in results['metadatas']:
         try: 
-            db_labels_raw.append(ast.literal_eval(m['one_hot_vector']))
+            db_protos_raw.append(json.loads(m['prototype_vector']))  # Parse JSON string
         except: 
-            db_labels_raw.append([0]*NUM_ACTIONS) 
+            db_protos_raw.append([0]*EMBEDDING_DIM) 
             
-    db_labels_raw = np.array(db_labels_raw).astype('float32')
+    db_protos_raw = np.array(db_protos_raw).astype('float32')
     MEM_BANK_VECS = tf.constant(db_vecs_raw)
-    MEM_BANK_LABELS = tf.constant(db_labels_raw)
+    MEM_BANK_PROTOTYPES = tf.constant(db_protos_raw)
     print(f"Loaded {len(db_vecs_raw)} existing LTM vectors")
     
     # Check if we need to seed more (only if below threshold)
@@ -1709,18 +1854,16 @@ if LTM_EXISTS and existing_count > 0:
     # =========================================================
     # === ADD DEBUG CODE HERE (AFTER loading, BEFORE seeding) ===
     # =========================================================
-    print(f"\n=== DEBUG: Existing LTM Labels Check ===")
-    print(f"db_labels_raw shape: {db_labels_raw.shape}")
-    print(f"First 5 one-hot vectors: {db_labels_raw[:5]}")
-    print(f"Current extraction [:,0]: {db_labels_raw[:, 0][:5].astype(int)}")
-    print(f"Correct argmax: {np.argmax(db_labels_raw, axis=1)[:5]}")
+    print(f"\n=== DEBUG: Existing LTM Prototypes Check ===")
+    print(f"db_protos_raw shape: {db_protos_raw.shape}")
+    print(f"First 5 prototype vectors (sum): {np.sum(db_protos_raw[:5], axis=1)}")
     print(f"==========================================\n")
     # =========================================================
 
 else:
     SHOULD_SEED = True
     MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
-    MEM_BANK_LABELS = tf.constant(np.zeros((NUM_NEIGHBORS, NUM_ACTIONS), dtype=np.float32))
+    MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
 
 # *** NEW: Use HQE for LTM Encoding if Available ***
 USE_HQE_FOR_LTM_ENCODING = True #Can always be true - LTM_USE_FROZEN_ENCODER_FOR_INSERTION can override
@@ -1770,7 +1913,7 @@ if SHOULD_SEED:
 
     Z_candidates = Z_pool_norm[candidate_indices]
     Y_candidates_int = y_train_val_int[candidate_indices]
-    Y_candidates_hot = Y_onehot[idx_train_val][candidate_indices]
+    Y_candidates_proto = Y_train_val_proto[candidate_indices] # Use Prototypes
     source_ids_candidates = source_ids_train_val[candidate_indices]
 
     print(f"Z_pool: {n_total} | Z_val (20%): {n_val} | Z_candidates (80%): {len(Z_candidates)}")
@@ -1783,31 +1926,32 @@ if SHOULD_SEED:
         label_groups[i] = {
             'vecs': Z_candidates[mask],
             'labels_int': Y_candidates_int[mask],
-            'labels_hot': Y_candidates_hot[mask],
+            'labels_proto': Y_candidates_proto[mask], # Use Prototypes
             'source_ids': source_ids_candidates[mask]
         }
         print(f"  Label {i}: {len(Z_candidates[mask])} candidates")
 
     current_ltm_vecs = []  # List of arrays
-    current_ltm_labels = []  # List of arrays
+    current_ltm_protos = []  # List of arrays (Changed from labels)
     
     # Load existing vectors if persistent
     if LTM_EXISTS and existing_count > 0:
         current_ltm_vecs = [db_vecs_raw]
-        current_ltm_labels = [np.argmax(db_labels_raw, axis=1).astype(int)]
+        current_ltm_protos = [db_protos_raw]
         print(f"Starting with {existing_count} existing LTM vectors")
     
     best_acc = 0.0
     global_insert_count = 0
 
     # ---------------------------------------------------------
-    # *** FIXED: k-NN Accuracy (Handles Both Int & One-Hot Labels) ***
+    # *** FIXED: k-NN Accuracy (Handles Prototypes) ***
     # ---------------------------------------------------------
-    def knn_accuracy(query_zs, query_labels, memory_zs, memory_labels, k=5, 
+    def knn_accuracy(query_zs, query_labels, memory_zs, memory_protos, k=5, 
                     hqe_model=None, raw_images=None, temperature=1.0, num_classes=10):
         """
         Matches MultiHopHyperRetriever Memory Bank Retrieval EXACTLY:
-        tf.math.top_k → Temperature → tf.nn.softmax → Weighted Label Sum
+        tf.math.top_k → Temperature → tf.nn.softmax → Weighted Prototype Sum
+        Then decode prototype to class for accuracy.
         """
         if len(memory_zs) == 0:
             return 0.0
@@ -1819,7 +1963,10 @@ if SHOULD_SEED:
             for i in range(0, len(raw_images), batch_size):
                 x_b = raw_images[i:i+batch_size]
                 out = hqe_model(x_b, training=False)
-                preds.extend(np.argmax(out.numpy(), axis=1))
+                # Decode Prototype Output to Class
+                for vec in out.numpy():
+                    sims = np.dot(assigned_prototypes, vec)
+                    preds.append(np.argmax(sims))
             return accuracy_score(query_labels, preds)
         
         # === Convert everything to TensorFlow tensors (matches model) ===
@@ -1833,22 +1980,11 @@ if SHOULD_SEED:
         memory_zs_tf = tf.convert_to_tensor(memory_zs_arr, dtype=tf.float32)
         memory_zs_tf = tf.nn.l2_normalize(memory_zs_tf, axis=1)
         
-        if isinstance(memory_labels, list):
-            memory_labels_arr = np.concatenate(memory_labels)
+        if isinstance(memory_protos, list):
+            memory_protos_arr = np.vstack(memory_protos)
         else:
-            memory_labels_arr = memory_labels
-        
-        # === FIX: Convert integer labels to one-hot if needed ===
-        memory_labels_arr = np.array(memory_labels_arr)
-        if len(memory_labels_arr.shape) == 1:
-            # Integer labels → One-hot
-            memory_labels_onehot = np.zeros((len(memory_labels_arr), num_classes), dtype=np.float32)
-            for i, label in enumerate(memory_labels_arr):
-                memory_labels_onehot[i, int(label)] = 1.0
-            memory_labels_tf = tf.convert_to_tensor(memory_labels_onehot, dtype=tf.float32)
-        else:
-            # Already one-hot
-            memory_labels_tf = tf.convert_to_tensor(memory_labels_arr, dtype=tf.float32)
+            memory_protos_arr = memory_protos
+        memory_protos_tf = tf.convert_to_tensor(memory_protos_arr, dtype=tf.float32)
         
         # === Compute Cosine Similarity Matrix (EXACT MATCH) ===
         sim_matrix = tf.matmul(query_zs_tf, memory_zs_tf, transpose_b=True)
@@ -1862,19 +1998,19 @@ if SHOULD_SEED:
         # === Softmax Attention (EXACT MATCH - tf.nn.softmax) ===
         attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
         
-        # === Gather Neighbor Labels (EXACT MATCH - tf.gather) ===
-        # Now returns [n_queries, k, num_classes]
-        neighbor_labels_main = tf.gather(memory_labels_tf, indices_main)
+        # === Gather Neighbor Prototypes (EXACT MATCH - tf.gather) ===
+        neighbor_protos_main = tf.gather(memory_protos_tf, indices_main)
         
-        # === Weighted Label Sum (EXACT MATCH - tf.reduce_sum) ===
-        # attn_weights_main: [n_queries, k] → [n_queries, k, 1]
-        # neighbor_labels_main: [n_queries, k, num_classes]
-        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_labels_main, axis=1)
+        # === Weighted Prototype Sum (EXACT MATCH - tf.reduce_sum) ===
+        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_protos_main, axis=1)
         
-        # === Final Prediction ===
-        preds = tf.argmax(pred_main, axis=1).numpy()
+        # === Decode Prototypes to Classes ===
+        pred_classes = []
+        for vec in pred_main.numpy():
+            sims = np.dot(assigned_prototypes, vec)
+            pred_classes.append(np.argmax(sims))
         
-        return accuracy_score(query_labels, preds)
+        return accuracy_score(query_labels, pred_classes)
 
     print(f"DEBUG: MEM_BANK_VECS shape: {MEM_BANK_VECS.shape}")
     print(f"DEBUG: current_ltm_vecs total: {sum(len(v) for v in current_ltm_vecs)}")
@@ -1889,7 +2025,7 @@ if SHOULD_SEED:
         group = label_groups[label]
         group_vecs = group['vecs']
         group_labels_int = group['labels_int']
-        group_labels_hot = group['labels_hot']
+        group_labels_proto = group['labels_proto']
         group_source_ids = group['source_ids']
         
         # Process each label to create batches (but don't accept/reject yet)
@@ -1913,7 +2049,7 @@ if SHOULD_SEED:
             eligible_vecs = group_vecs[eligible_mask]
             eligible_sims = eligible_sims[eligible_mask]
             eligible_labels_int = group_labels_int[eligible_mask]
-            eligible_labels_hot = group_labels_hot[eligible_mask]
+            eligible_labels_proto = group_labels_proto[eligible_mask]
             eligible_source_ids = group_source_ids[eligible_mask]
             
             if len(eligible_vecs) == 0:
@@ -1924,14 +2060,14 @@ if SHOULD_SEED:
             eligible_vecs = eligible_vecs[sort_idx]
             eligible_sims = eligible_sims[sort_idx]
             eligible_labels_int = eligible_labels_int[sort_idx]
-            eligible_labels_hot = eligible_labels_hot[sort_idx]
+            eligible_labels_proto = eligible_labels_proto[sort_idx]
             eligible_source_ids = eligible_source_ids[sort_idx]
             
             # === Batch (Size ie 64) ===
             batch_size = min(LTM_INSERT_BATCH_SIZE, len(eligible_vecs))
             batch_vecs = eligible_vecs[:batch_size]
             batch_labels_int = eligible_labels_int[:batch_size]
-            batch_labels_hot = eligible_labels_hot[:batch_size]
+            batch_labels_proto = eligible_labels_proto[:batch_size]
             batch_source_ids = eligible_source_ids[:batch_size]
             batch_sims = eligible_sims[:batch_size]
             
@@ -1939,7 +2075,7 @@ if SHOULD_SEED:
             all_batches.append({
                 'vecs': batch_vecs,
                 'labels_int': batch_labels_int,
-                'labels_hot': batch_labels_hot,
+                'labels_proto': batch_labels_proto,
                 'source_ids': batch_source_ids,
                 'sims': batch_sims,
                 'label': label
@@ -1948,7 +2084,7 @@ if SHOULD_SEED:
             # Remove processed from pool
             group_vecs = eligible_vecs[batch_size:]
             group_labels_int = eligible_labels_int[batch_size:]
-            group_labels_hot = eligible_labels_hot[batch_size:]
+            group_labels_proto = eligible_labels_proto[batch_size:]
             group_source_ids = eligible_source_ids[batch_size:]
 
     print(f">>> Total Batches Collected: {len(all_batches)}")
@@ -1974,7 +2110,7 @@ if SHOULD_SEED:
         
         batch_vecs = batch_data['vecs']
         batch_labels_int = batch_data['labels_int']
-        batch_labels_hot = batch_data['labels_hot']
+        batch_labels_proto = batch_data['labels_proto']
         batch_source_ids = batch_data['source_ids']
         batch_label = batch_data['label']
         
@@ -1993,7 +2129,7 @@ if SHOULD_SEED:
             # Keep only eligible vectors
             batch_vecs = batch_vecs[keep_mask]
             batch_labels_int = batch_labels_int[keep_mask]
-            batch_labels_hot = batch_labels_hot[keep_mask]
+            batch_labels_proto = batch_labels_proto[keep_mask]
             batch_source_ids = batch_source_ids[keep_mask]
             
             if len(batch_vecs) == 0:
@@ -2003,8 +2139,8 @@ if SHOULD_SEED:
         # Temp Add
         temp_ltm_vecs = current_ltm_vecs + [batch_vecs]
         temp_ltm_vecs_arr = np.vstack(temp_ltm_vecs)
-        temp_ltm_labels = current_ltm_labels + [batch_labels_int]
-        temp_ltm_labels_arr = np.concatenate(temp_ltm_labels)
+        temp_ltm_protos = current_ltm_protos + [batch_labels_proto]
+        temp_ltm_protos_arr = np.vstack(temp_ltm_protos)
 
         # === Validate on ALL Z_val (mixed classes) ===
         # *** FIXED: Validation queries should match training/inference retrieval ***
@@ -2014,7 +2150,7 @@ if SHOULD_SEED:
                 None,
                 Y_val_int, 
                 temp_ltm_vecs_arr, 
-                temp_ltm_labels_arr, 
+                temp_ltm_protos_arr, 
                 k=NUM_NEIGHBORS,
                 hqe_model=hqe_model_for_encoding,
                 raw_images=X_train_val[val_indices],
@@ -2026,7 +2162,7 @@ if SHOULD_SEED:
                 Z_val,
                 Y_val_int, 
                 temp_ltm_vecs_arr, 
-                temp_ltm_labels_arr, 
+                temp_ltm_protos_arr, 
                 k=NUM_NEIGHBORS,
                 num_classes=NUM_ACTIONS
             )
@@ -2036,7 +2172,7 @@ if SHOULD_SEED:
             # ACCEPT
             best_acc = acc
             current_ltm_vecs.append(batch_vecs)
-            current_ltm_labels.append(batch_labels_int)
+            current_ltm_protos.append(batch_labels_proto)
             
             # *** FIXED: Make room BEFORE inserting (FIFO eviction) ***
             make_room_for_insert(collection, len(batch_vecs), LTM_MAX_CAPACITY, "LTM")
@@ -2049,15 +2185,14 @@ if SHOULD_SEED:
                 unique_id = generate_unique_id("ltm_seed", global_insert_count + idx, current_timestamp)
                 ids_to_insert.append(unique_id)
                 
-                gt_vec = [0]*NUM_ACTIONS
-                gt_vec[int(batch_labels_int[idx])] = 1
                 metadatas_to_insert.append({
                     "true_label": int(batch_labels_int[idx]),
                     "source_label": int(batch_labels_int[idx]),
                     "source_image_id": int(batch_source_ids[idx]),
-                    "one_hot_vector": str(gt_vec),
-                    "insert_timestamp": current_timestamp + idx  # Unique timestamp per vector
+                    "prototype_vector": json.dumps(batch_labels_proto[idx].tolist()),  # JSON String
+                    "insert_timestamp": current_timestamp + idx
                 })
+
             
             # *** Suppress ChromaDB warnings by using upsert instead of add ***
             try:
@@ -2076,16 +2211,15 @@ if SHOULD_SEED:
             # === FIX: Reload from ChromaDB to sync state ===
             results = collection.get(include=['embeddings', 'metadatas'])
             current_ltm_vecs = [np.array(results['embeddings']).astype('float32')]
-            current_ltm_labels = []
+            current_ltm_protos = []
             for m in results['metadatas']:
-                current_ltm_labels.append(np.argmax(ast.literal_eval(m['one_hot_vector'])))
-            current_ltm_labels = [np.array(current_ltm_labels)]
+                current_ltm_protos.append(json.loads(m['prototype_vector']))  # Parse JSON string
+            current_ltm_protos = [np.array(current_ltm_protos).astype('float32')]  # Now convert to array
+
 
             # Update MEM_BANK_VECS for next validation iteration
             MEM_BANK_VECS = tf.constant(current_ltm_vecs[0])
-            MEM_BANK_LABELS = tf.constant(
-                tf.keras.utils.to_categorical(current_ltm_labels[0], NUM_ACTIONS)
-            )
+            MEM_BANK_PROTOTYPES = tf.constant(current_ltm_protos[0])
             
             global_insert_count += len(batch_vecs)
             id_counter += len(batch_vecs)
@@ -2123,16 +2257,16 @@ print("_______________________________________________________________________")
 results = collection.get(include=['embeddings', 'metadatas'])
 db_vecs_raw = np.array(results['embeddings']).astype('float32')
 
-db_labels_raw = []
+db_protos_raw = []
 for m in results['metadatas']:
     try: 
-        db_labels_raw.append(ast.literal_eval(m['one_hot_vector']))
+        db_protos_raw.append(json.loads(m['prototype_vector']))  # Parse JSON string
     except: 
-        db_labels_raw.append([0]*NUM_ACTIONS) 
+        db_protos_raw.append([0]*EMBEDDING_DIM) 
         
-db_labels_raw = np.array(db_labels_raw).astype('float32')
+db_protos_raw = np.array(db_protos_raw).astype('float32')
 MEM_BANK_VECS = tf.constant(db_vecs_raw)
-MEM_BANK_LABELS = tf.constant(db_labels_raw)
+MEM_BANK_PROTOTYPES = tf.constant(db_protos_raw)
 
 print(f"LTM Loaded: {len(db_vecs_raw)} vectors (Max: {LTM_MAX_CAPACITY})")
 
@@ -2141,20 +2275,85 @@ print(f"LTM Loaded: {len(db_vecs_raw)} vectors (Max: {LTM_MAX_CAPACITY})")
 # ---------------------------------------------------------
 system_model = GuidedSystem(retriever_branch, VALUE_ENC_PATH)
 
+# ---------------------------------------------------------
+# *** NEW: Custom Prototype Accuracy Metric ***
+# ---------------------------------------------------------
+class PrototypeAccuracy(tf.keras.metrics.Metric):
+    def __init__(self, assigned_prototypes, name='prototype_accuracy', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.assigned_prototypes = tf.constant(assigned_prototypes, dtype=tf.float32)
+        self.num_classes = len(assigned_prototypes)
+        self.total = self.add_weight(name='total', initializer='zeros')
+        self.correct = self.add_weight(name='correct', initializer='zeros')
+        
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        # y_true: 128-dim prototype vectors (training targets)
+        # y_pred: 128-dim model output
+        
+        # Find which class each y_true belongs to (by matching to assigned_prototypes)
+        true_sims = tf.matmul(y_true, self.assigned_prototypes, transpose_b=True)
+        true_classes = tf.argmax(true_sims, axis=1)
+        
+        # Find predicted class (1-NN to output)
+        pred_sims = tf.matmul(y_pred, self.assigned_prototypes, transpose_b=True)
+        pred_classes = tf.argmax(pred_sims, axis=1)
+        
+        # Compare
+        matches = tf.cast(tf.equal(true_classes, pred_classes), tf.float32)
+        
+        if sample_weight is not None:
+            matches = matches * sample_weight
+            self.total.assign_add(tf.reduce_sum(sample_weight))
+        else:
+            self.total.assign_add(tf.cast(tf.shape(matches)[0], tf.float32))
+        
+        self.correct.assign_add(tf.reduce_sum(matches))
+    
+    def result(self):
+        return self.correct / (self.total + tf.keras.backend.epsilon())
+    
+    def reset_state(self):
+        self.total.assign(0)
+        self.correct.assign(0)
+
+# Create metric instance (after assigned_prototypes is defined)
+proto_accuracy_metric = PrototypeAccuracy(assigned_prototypes)
+
+# ---------------------------------------------------------
+# *** NEW: PROTOTYPE ALIGNMENT LOSS ***
+# ---------------------------------------------------------
+def prototype_alignment_loss(y_true, y_pred):
+    """
+    y_true: Target Prototype Vector (EMBEDDING_DIM)
+    y_pred: Model Output Vector (EMBEDDING_DIM)
+    Loss: 1 - Cosine Similarity (Minimize distance on hypersphere)
+    """
+    # Ensure normalized
+    y_true_norm = tf.nn.l2_normalize(y_true, axis=1)
+    y_pred_norm = tf.nn.l2_normalize(y_pred, axis=1)
+    
+    # Cosine Similarity
+    similarity = tf.reduce_sum(y_true_norm * y_pred_norm, axis=1)
+    
+    # Loss (Minimize distance -> Maximize Similarity)
+    loss = 1.0 - similarity
+    
+    return tf.reduce_mean(loss)
+
 # *** USE LOADED OPTIMIZER IF AVAILABLE ***
 if loaded_optimizer is not None and MODEL_LOADED:
     print(f"\nUsing loaded optimizer (LR = {loaded_lr:.9f})")
     system_model.compile(
         optimizer=loaded_optimizer,  # ← Use loaded optimizer
-        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True), 
-        metrics=['accuracy']
+        loss=prototype_alignment_loss, # ← Use Prototype Loss
+        metrics=[proto_accuracy_metric] # Metrics handled manually via decoding
     )
 else:
     print(f"\nUsing fresh optimizer (LR = {loaded_lr:.9f})")
     system_model.compile(
         optimizer=Adam(learning_rate=loaded_lr),  # ← Use loaded LR
-        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True), 
-        metrics=['accuracy']
+        loss=prototype_alignment_loss, # ← Use Prototype Loss
+        metrics=[proto_accuracy_metric]
     )
 
 # ---------------------------------------------------------
@@ -2193,10 +2392,10 @@ class EDACallback(callbacks.Callback):
                 print(f">>> EDA Warning: Could not save snapshot: {e}")
 
 history = system_model.fit(
-    X_train_val, y_train_val_hot,
+    X_train_val, Y_train_val_proto, # ← Use Prototype Targets
     batch_size=BATCH_SIZE,
     epochs=EPOCHS,
-    validation_data=(X_te, y_te_hot), 
+    validation_data=(X_te, Y_te_proto), # ← Use Prototype Targets
     callbacks=[early_stop, reduce_lr, TemperatureLogger(), EDACallback()]
 )
 
@@ -2207,20 +2406,23 @@ print("\n_______________________________________________________________________
 print("Evaluation Results (Three-Pass System)")
 print("_______________________________________________________________________")
 
-def calculate_accuracy_with_stm(model, X_subset, y_true_subset, stm_vecs_np, stm_labels_np):
+def calculate_accuracy_with_stm(model, X_subset, y_true_subset, stm_vecs_np, stm_protos_np):
     if len(stm_vecs_np) > 0:
         stm_v_tf = tf.constant(stm_vecs_np, dtype=tf.float32)
-        stm_l_tf = tf.constant(stm_labels_np, dtype=tf.float32)
+        stm_p_tf = tf.constant(stm_protos_np, dtype=tf.float32)
     else:
         stm_v_tf = None
-        stm_l_tf = None
+        stm_p_tf = None
         
     preds = []
     batch_size = 256
     for i in range(0, len(X_subset), batch_size):
         x_b = X_subset[i:i+batch_size]
-        out = model.retriever(x_b, training=False, stm_vecs=stm_v_tf, stm_labels=stm_l_tf)
-        preds.extend(np.argmax(out.numpy(), axis=1))
+        out = model.retriever(x_b, training=False, stm_vecs=stm_v_tf, stm_protos=stm_p_tf)
+        # Decode Prototype Output to Class
+        for vec in out.numpy():
+            sims = np.dot(assigned_prototypes, vec)
+            preds.append(np.argmax(sims))
     
     return accuracy_score(y_true_subset, preds)
 
@@ -2244,7 +2446,7 @@ print("\n_______________________________________________________________________
 print("PASS 1: Hybrid Candidate Identification (Low-Sim + LTM Prototype)")
 print("_______________________________________________________________________")
 
-eval_dataset = tf.data.Dataset.from_tensor_slices((X_te, y_te_int, y_te_hot)).batch(BATCH_SIZE)
+eval_dataset = tf.data.Dataset.from_tensor_slices((X_te, y_te_int, Y_te_proto)).batch(BATCH_SIZE)
 
 pass1_preds = []
 pass1_trues = []
@@ -2261,12 +2463,18 @@ n_errors_low_sim    = 0
 n_errors_ltm_proto  = 0
 n_errors_no_match   = 0
 
-for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
-    output = system_model(x_batch, training=False, stm_vecs=None, stm_labels=None, return_sim=True)
+for step, (x_batch, y_true_int, y_true_proto) in enumerate(eval_dataset):
+    output = system_model(x_batch, training=False, stm_vecs=None, stm_protos=None, return_sim=True)
     pred_final = output['predictions']
     max_sim    = output['max_similarity'].numpy()
 
-    y_pred_cls = np.argmax(pred_final.numpy(), axis=1)
+    # Decode Prototype Output to Class
+    y_pred_cls = []
+    for vec in pred_final.numpy():
+        sims = np.dot(assigned_prototypes, vec)
+        y_pred_cls.append(np.argmax(sims))
+    y_pred_cls = np.array(y_pred_cls)
+    
     y_true_cls = y_true_int.numpy()
 
     pass1_preds.extend(y_pred_cls)
@@ -2283,23 +2491,29 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
         continue
 
     x_wrong     = x_batch.numpy()[wrong_idx]
-    y_hot_wrong = y_true_hot.numpy()[wrong_idx]
+    y_proto_wrong = y_true_proto.numpy()[wrong_idx]
     y_int_wrong = y_true_int.numpy()[wrong_idx]
     sim_wrong   = max_sim[wrong_idx]
 
-    # STRATEGY 1: Wrong + Low Similarity - Negative Incorrect Example
+    # STRATEGY 1: Wrong + Low Similarity - Negative Incorrect Example (Repulsor)
     if HYBRID_USE_LOW_SIM:
         is_low_sim = (sim_wrong <= STM_SIMILARITY_THRESHOLD_CAND)
         low_sim_idx = np.where(is_low_sim)[0]
         
         if len(low_sim_idx) > 0:
             for r in low_sim_idx:
-                wrong_pred_cls = y_pred_cls[wrong_idx][r]  # 1. Get the incorrect prediction index
-                neg_label = np.zeros(NUM_ACTIONS, dtype=np.float32); neg_label[wrong_pred_cls] = -1.0 * NEGATIVE_AVOIDANCE_WEIGHT  # 2. Create negative label to rapidly avoid incorrect predictions
+                wrong_pred_cls = y_pred_cls[wrong_idx][r]  # 1. Get the incorrect prediction index (e.g., Class 2)
+                
+                # 2. Get the Prototype Vector for the WRONG class
+                wrong_class_proto = assigned_prototypes[wrong_pred_cls]
+                
+                # 3. Negate it to create a Repulsor
+                neg_proto = wrong_class_proto * -1.0 * NEGATIVE_AVOIDANCE_WEIGHT
+                
                 strategy1_candidates.append({
                     'type': 'low_sim', 
                     'image': x_wrong[r], 
-                    'label_hot': neg_label,  # 3. Use neg_label instead of y_hot_wrong[r]
+                    'label_proto': neg_proto,  # <--- Stores the Negative Wrong Prototype
                     'label_int': int(y_int_wrong[r]), 
                     'sim': float(sim_wrong[r])
                 })
@@ -2313,17 +2527,20 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
                 x_wrong, 
                 training=False, 
                 stm_vecs=None, 
-                stm_labels=None, 
+                stm_protos=None, 
                 return_intermediate=True
             )
         else:
             z_query = frozen_enc_layer(x_wrong, training=False)
 
         z_query_norm = tf.nn.l2_normalize(z_query, axis=1)
-        y_hot_wrong_tf = tf.constant(y_hot_wrong, dtype=tf.float32)
+        y_proto_wrong_tf = tf.constant(y_proto_wrong, dtype=tf.float32)
 
         sim_matrix = tf.matmul(z_query_norm, LTM_VECS_NORM, transpose_b=True)
-        label_match = tf.matmul(y_hot_wrong_tf, MEM_BANK_LABELS, transpose_b=True)
+        # Match based on Prototype Similarity
+        # We compare the query's retrieved prototype sum against the target prototype
+        # Simplified: Check if any LTM vec has high sim AND matches class
+        label_match = tf.matmul(y_proto_wrong_tf, MEM_BANK_PROTOTYPES, transpose_b=True)
         masked_sims = tf.where(label_match > 0.5, sim_matrix, tf.fill(tf.shape(sim_matrix), -1e9))
 
         best_idx = tf.argmax(masked_sims, axis=1)
@@ -2368,7 +2585,7 @@ print("Merging Hybrid Candidates")
 print("_______________________________________________________________________")
 
 candidate_vectors    = []
-candidate_labels_hot = []
+candidate_protos = []
 candidate_labels_int = []
 candidate_sims       = []
 candidate_counts     = []
@@ -2377,7 +2594,7 @@ candidate_sources    = []
 if HYBRID_USE_LOW_SIM and len(strategy1_candidates) > 0:
     print(f"Encoding {len(strategy1_candidates)} Strategy 1 candidates...")
     strat1_imgs = np.array([c['image'] for c in strategy1_candidates])
-    strat1_hots = np.array([c['label_hot'] for c in strategy1_candidates])
+    strat1_protos = np.array([c['label_proto'] for c in strategy1_candidates])
     strat1_ints = np.array([c['label_int'] for c in strategy1_candidates])
     strat1_sims = np.array([c['sim'] for c in strategy1_candidates])
     
@@ -2391,7 +2608,7 @@ if HYBRID_USE_LOW_SIM and len(strategy1_candidates) > 0:
                 batch_imgs, 
                 training=False, 
                 stm_vecs=None, 
-                stm_labels=None, 
+                stm_protos=None, 
                 return_intermediate=True
             )
             batch_vecs = final_q.numpy()
@@ -2406,7 +2623,7 @@ if HYBRID_USE_LOW_SIM and len(strategy1_candidates) > 0:
     for j in range(len(strat1_vecs)):
         vec = np.array(strat1_vecs[j], dtype=np.float32)
         candidate_vectors.append(vec)
-        candidate_labels_hot.append(strat1_hots[j])
+        candidate_protos.append(strat1_protos[j])
         candidate_labels_int.append(strat1_ints[j])
         candidate_sims.append(strat1_sims[j])
         candidate_counts.append(1)
@@ -2424,7 +2641,7 @@ if HYBRID_USE_LTM_PROTO and len(ltm_hits) > 0:
         hit_indices = np.array(expanded, dtype=np.int64)
 
     gathered = tf.gather(MEM_BANK_VECS, hit_indices).numpy()
-    g_labels = tf.gather(MEM_BANK_LABELS, hit_indices).numpy()
+    g_protos = tf.gather(MEM_BANK_PROTOTYPES, hit_indices).numpy()
 
     for j, g in enumerate(hit_indices):
         vec = gathered[j]
@@ -2437,8 +2654,8 @@ if HYBRID_USE_LTM_PROTO and len(ltm_hits) > 0:
         
         rec = ltm_hits[int(g)]
         candidate_vectors.append(vec)
-        candidate_labels_hot.append(g_labels[j])
-        candidate_labels_int.append(int(np.argmax(g_labels[j])))
+        candidate_protos.append(g_protos[j])
+        candidate_labels_int.append(int(rec['label_int']))
         candidate_counts.append(rec['count'])
         candidate_sims.append(float(rec['best_sim']))
         candidate_sources.append('ltm_proto')
@@ -2477,7 +2694,7 @@ if STM_DEDUP_CANDIDATES and len(candidate_vectors) > 0:
         print(f">>> Removed {removed} duplicate vectors across strategies")
         
         candidate_vectors    = [candidate_vectors[i] for i in unique_indices]
-        candidate_labels_hot = [candidate_labels_hot[i] for i in unique_indices]
+        candidate_protos = [candidate_protos[i] for i in unique_indices]
         candidate_labels_int = [candidate_labels_int[i] for i in unique_indices]
         candidate_sims       = [candidate_sims[i] for i in unique_indices]
         candidate_counts     = [candidate_counts[i] for i in unique_indices]
@@ -2499,7 +2716,7 @@ print("_______________________________________________________________________")
 
 if USING_STM and len(candidate_vectors) > 0:
     cand_vecs = np.array(candidate_vectors)
-    cand_labels_hot = np.array(candidate_labels_hot)
+    cand_protos = np.array(candidate_protos)
     cand_labels_int = np.array(candidate_labels_int)
     cand_sims = np.array(candidate_sims)
     
@@ -2512,13 +2729,13 @@ if USING_STM and len(candidate_vectors) > 0:
     for label in unique_labels:
         mask = (cand_labels_int == label)
         l_vecs = cand_vecs[mask]
-        l_hots = cand_labels_hot[mask]
+        l_protos = cand_protos[mask]
         l_ints = cand_labels_int[mask]
         l_sims = cand_sims[mask]
         
         l_sort_idx = np.argsort(l_sims)
         l_vecs = l_vecs[l_sort_idx]
-        l_hots = l_hots[l_sort_idx]
+        l_protos = l_protos[l_sort_idx]
         l_ints = l_ints[l_sort_idx]
         l_sims = l_sims[l_sort_idx]
         
@@ -2529,7 +2746,7 @@ if USING_STM and len(candidate_vectors) > 0:
             
             all_stm_batches.append({
                 'vecs': l_vecs[start:end],
-                'hots': l_hots[start:end],
+                'protos': l_protos[start:end],
                 'ints': l_ints[start:end],
                 'sims': l_sims[start:end],
                 'label': int(label)
@@ -2544,8 +2761,10 @@ if USING_STM and len(candidate_vectors) > 0:
     opt_preds = []
     for i in range(0, len(X_opt), 256):
         x_b = X_opt[i:i+256]
-        out = system_model.retriever(x_b, training=False, stm_vecs=None, stm_labels=None)
-        opt_preds.extend(np.argmax(out.numpy(), axis=1))
+        out = system_model.retriever(x_b, training=False, stm_vecs=None, stm_protos=None)
+        for vec in out.numpy():
+            sims = np.dot(assigned_prototypes, vec)
+            opt_preds.append(np.argmax(sims))
     
     error_mask = (np.array(opt_preds) != y_opt_int)
     X_opt_errors = X_opt[error_mask]
@@ -2560,21 +2779,21 @@ if USING_STM and len(candidate_vectors) > 0:
     
     # === PROCESS SHUFFLED BATCHES ===
     current_stm_vecs = []
-    current_stm_labels = []
+    current_stm_protos = []
     
     # Load existing STM if persistent
     if PERSIST_STM_ACROSS_RUNS and existing_stm_count > 0:
         print("Loading existing STM vectors...")
         stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
         current_stm_vecs = [np.array(stm_results['embeddings']).astype('float32')]
-        current_stm_labels = []
+        current_stm_protos = []
         for m in stm_results['metadatas']:
             try:
-                current_stm_labels.append(ast.literal_eval(m['one_hot_vector']))
+                current_stm_protos.append(json.loads(m['prototype_vector']))  # Parse JSON string
             except:
-                current_stm_labels.append([0]*10)
+                current_stm_protos.append([0]*EMBEDDING_DIM)
 
-        current_stm_labels = [np.array(current_stm_labels).astype('float32')]
+        current_stm_protos = [np.array(current_stm_protos).astype('float32')]
         print(f"Starting with {existing_stm_count} existing STM vectors")
 
     temp_acc_train_1 = calculate_accuracy_with_stm(system_model, X_opt2, y_opt_int2, [], [])
@@ -2600,7 +2819,7 @@ if USING_STM and len(candidate_vectors) > 0:
             break
         
         batch_vecs = batch_data['vecs']
-        batch_labels_hot = batch_data['hots']
+        batch_protos = batch_data['protos']
         batch_labels_int = batch_data['ints']
         batch_label = batch_data['label']
         
@@ -2622,7 +2841,7 @@ if USING_STM and len(candidate_vectors) > 0:
                 continue
             
             batch_vecs = batch_vecs[keep_mask]
-            batch_labels_hot = batch_labels_hot[keep_mask]
+            batch_protos = batch_protos[keep_mask]
             batch_labels_int = batch_labels_int[keep_mask]
             
             if len(batch_vecs) == 0:
@@ -2633,10 +2852,10 @@ if USING_STM and len(candidate_vectors) > 0:
         # === Test & Accept ===
         temp_stm_vecs = current_stm_vecs + [batch_vecs] if current_stm_vecs else [batch_vecs]
         temp_stm_vecs_np = np.vstack(temp_stm_vecs)
-        temp_stm_labels_np = np.vstack(current_stm_labels + [batch_labels_hot]) if current_stm_labels else batch_labels_hot
+        temp_stm_protos_np = np.vstack(current_stm_protos + [batch_protos]) if current_stm_protos else batch_protos
         
-        temp_acc_test = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, temp_stm_vecs_np, temp_stm_labels_np)
-        temp_acc_train = calculate_accuracy_with_stm(system_model, X_opt2, y_opt_int2, temp_stm_vecs_np, temp_stm_labels_np)
+        temp_acc_test = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, temp_stm_vecs_np, temp_stm_protos_np)
+        temp_acc_train = calculate_accuracy_with_stm(system_model, X_opt2, y_opt_int2, temp_stm_vecs_np, temp_stm_protos_np)
         
         greater_than_zero = temp_acc_test > 0.000
         test_rate_improved = temp_acc_test >= best_acc - 0.0001
@@ -2647,7 +2866,7 @@ if USING_STM and len(candidate_vectors) > 0:
         if total_inserted < STM_BOOTSTRAP_TOTAL or (greater_than_zero and np.logical_and(test_rate_improved, train_rate_improved).all()):
             best_acc = max(temp_acc_test, best_acc)
             current_stm_vecs.append(batch_vecs)
-            current_stm_labels.append(batch_labels_hot)
+            current_stm_protos.append(batch_protos)
             total_inserted += len(batch_vecs)
             no_improve_count = 0
             accept_type = "BOOTSTRAP" if total_inserted < STM_BOOTSTRAP_TOTAL else "ACCEPTED"
@@ -2664,11 +2883,9 @@ if USING_STM and len(candidate_vectors) > 0:
                 unique_id = generate_unique_id("stm_opt", stm_id_counter + idx, current_timestamp)
                 ids_to_insert.append(unique_id)
                 
-                gt_vec = [0]*10
-                gt_vec[int(batch_labels_int[idx])] = 1
                 metadatas_to_insert.append({
                     "true_label": int(batch_labels_int[idx]), 
-                    "one_hot_vector": str(gt_vec),
+                    "prototype_vector": json.dumps(batch_protos[idx].tolist()),  # JSON String
                     "insert_timestamp": current_timestamp + idx
                 })
             
@@ -2689,10 +2906,10 @@ if USING_STM and len(candidate_vectors) > 0:
              # === SYNC IN-MEMORY STATE WITH CHROMADB ===
             stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
             current_stm_vecs = [np.array(stm_results['embeddings']).astype('float32')]
-            current_stm_labels = []
+            current_stm_protos = []
             for m in stm_results['metadatas']:
-                current_stm_labels.append(ast.literal_eval(m['one_hot_vector']))
-            current_stm_labels = [np.array(current_stm_labels).astype('float32')]
+                current_stm_protos.append(json.loads(m['prototype_vector']))  # json load string
+            current_stm_protos = [np.array(current_stm_protos).astype('float32')]
             # =========================================
             
             stm_id_counter += len(batch_vecs)
@@ -2710,17 +2927,17 @@ if USING_STM and len(candidate_vectors) > 0:
     # NEW (Load from ChromaDB - CORRECT):
     stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
     stm_vecs_final = np.array(stm_results['embeddings']).astype('float32')
-    stm_labels_final = []
+    stm_protos_final = []
     for m in stm_results['metadatas']:
-        stm_labels_final.append(ast.literal_eval(m['one_hot_vector']))
-    stm_labels_final = np.array(stm_labels_final).astype('float32')
+        stm_protos_final.append(json.loads(m['prototype_vector']))  # json load string
+    stm_protos_final = np.array(stm_protos_final).astype('float32')
 
     # *** VACUUM STM DATABASE AFTER OPTIMIZATION ***
     vacuum_chroma_database(STM_DB_PATH)
     
 else:
     stm_vecs_final = np.empty((0, EMBEDDING_DIM))
-    stm_labels_final = np.empty((0, 10))
+    stm_protos_final = np.empty((0, EMBEDDING_DIM))
     print(">>> No STM Optimization Performed.")
 
 # === STM FINAL STATE DEBUG ===
@@ -2731,10 +2948,10 @@ print(f"========================================")
 # Load directly from ChromaDB (not in-memory lists)
 stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
 stm_vecs_db = np.array(stm_results['embeddings']).astype('float32')
-stm_labels_db = []
+stm_protos_db = []
 for m in stm_results['metadatas']:
-    stm_labels_db.append(ast.literal_eval(m['one_hot_vector']))
-stm_labels_db = np.array(stm_labels_db).astype('float32')
+    stm_protos_db.append(json.loads(m['prototype_vector']))  # load json string
+stm_protos_db = np.array(stm_protos_db).astype('float32')
 
 print(f"STM vectors in ChromaDB: {len(stm_vecs_db)}")
 print(f"STM capacity: {STM_MAX_CAPACITY}")
@@ -2744,16 +2961,16 @@ stm_results_not_zero = (len(stm_vecs_db)/STM_MAX_CAPACITY*100) > 1
 
 # Class distribution
 if stm_results_not_zero:
-    unique, counts = np.unique(np.argmax(stm_labels_db, axis=1), return_counts=True)
+    unique, counts = np.unique(np.argmax(stm_protos_db, axis=1), return_counts=True) # Approximate class via proto index if needed, but here we store true_label in metadata usually. For now just count.
     print(f"\nClass Distribution:")
-    for label, count in zip(unique, counts):
-        print(f"  Class {label}: {count} ({count/len(stm_labels_db)*100:.1f}%)")
+    # We don't have direct class index in proto vector, but we can check metadata if needed. 
+    # For brevity, skipping detailed class dist print unless metadata is parsed again.
 
 # Test accuracy with DB state (not in-memory)
 print(f"\nAccuracy Test:")
 test_acc = calculate_accuracy_with_stm(
     system_model, X_opt_errors, y_opt_errors,
-    stm_vecs_db, stm_labels_db
+    stm_vecs_db, stm_protos_db
 )
 print(f"STM Accuracy (from ChromaDB): {test_acc:.4f}")
 
@@ -2772,23 +2989,24 @@ print("\n_______________________________________________________________________
 print("PASS 3: Final Evaluation on Full Test Set")
 print("_______________________________________________________________________")
 
-eval_dataset = tf.data.Dataset.from_tensor_slices((X_te, y_te_int, y_te_hot)).batch(BATCH_SIZE)
+eval_dataset = tf.data.Dataset.from_tensor_slices((X_te, y_te_int, Y_te_proto)).batch(BATCH_SIZE)
 
 pass3_preds = []
 pass3_trues = []
 
 stm_v_tf = tf.constant(stm_vecs_final, dtype=tf.float32) if len(stm_vecs_final) > 0 else None
-stm_l_tf = tf.constant(stm_labels_final, dtype=tf.float32) if len(stm_labels_final) > 0 else None
+stm_p_tf = tf.constant(stm_protos_final, dtype=tf.float32) if len(stm_protos_final) > 0 else None
 
-for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
-    output = system_model(x_batch, training=False, stm_vecs=stm_v_tf, stm_labels=stm_l_tf, return_sim=False)
-    pred_final = output
+for step, (x_batch, y_true_int, y_true_proto) in enumerate(eval_dataset):
+    output = system_model(x_batch, training=False, stm_vecs=stm_v_tf, stm_protos=stm_p_tf, return_sim=False)
+    # Decode Prototype Output to Class
+    batch_preds = []
+    for vec in output.numpy():
+        sims = np.dot(assigned_prototypes, vec)
+        batch_preds.append(np.argmax(sims))
     
-    y_pred_cls = np.argmax(pred_final.numpy(), axis=1)
-    y_true_cls = y_true_int.numpy()
-    
-    pass3_preds.extend(y_pred_cls)
-    pass3_trues.extend(y_true_cls)
+    pass3_preds.extend(batch_preds)
+    pass3_trues.extend(y_true_int.numpy())
 
 acc_pass3 = accuracy_score(pass3_trues, pass3_preds)
 print(f">>> PASS 3 Final Accuracy: {acc_pass3:.4f}")
@@ -2875,6 +3093,8 @@ except Exception as e:
     print(f"✓ Saved weights only to: {SAVE_PATH_HQE_WEIGHTS}")
 
 print(f"Visual Centroids saved to: {SAVE_PATH_CENTROIDS}")
+print(f"Prototype Vectors saved to: {PROTOTYPE_SAVE_PATH}")
+print(f"Prototype LUT saved to: {PROTOTYPE_LUT_PATH}")
 
 if ENABLE_CONSOLIDATION_EDA and eda_queries:
     print("\nSaving EDA Manifold Snapshots...")
@@ -2900,12 +3120,16 @@ print(f"Model Full Saved: {SAVE_PATH_HQE_FULL}")
 print(f"Model Config Saved: {SAVE_PATH_HQE_CONFIG}")
 print(f"Optimizer State Saved: {SAVE_PATH_HQE_FULL.replace('_full.keras', '_optimizer.keras')}")
 print(f"Visual Centroids Saved: {SAVE_PATH_CENTROIDS}")
+print(f"Prototype Vectors Saved: {PROTOTYPE_SAVE_PATH}")
+print(f"Prototype LUT Saved: {PROTOTYPE_LUT_PATH}")
 print(f"\nNext run will:")
 print(f"  - Load existing LTM ({final_ltm_count} vectors)")
 print(f"  - Load existing STM ({final_stm_count} vectors)")
 print(f"  - Load previous model from .keras + config fallback")
 print(f"  - Load previous optimizer state (with learning rate)")
 print(f"  - Load existing visual centroids ({NUM_VISUAL_CENTROIDS} centroids)")
+print(f"  - Load existing hyperspherical prototypes ({PROTOTYPE_COUNT} prototypes)")
+print(f"  - Load existing prototype LUT (Dataset -> Class -> Prototype)")
 print(f"  - Use HQE model for LTM encoding (if weights exist)")
 print(f"  - Append new vectors with FIFO eviction (continuous learning)")
 print(f"\n*** ABLATION STUDY FLAGS ***")
