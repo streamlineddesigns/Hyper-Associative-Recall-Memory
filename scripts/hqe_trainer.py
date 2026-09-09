@@ -145,7 +145,7 @@ HYBRID_USE_LTM_PROTO = True
 
 # Hypernetwork Config (From Script B)
 NUM_VISUAL_CENTROIDS = 10
-NUM_ACTIONS = 10 # Used for Class Count logic
+NUM_CLASSES = 10 # Used for Class Count logic
 TARGET_NET_ARCH = [64, 32]
 HYPER_INTERMEDIATE_DIM = 98
 
@@ -568,8 +568,10 @@ print("_______________________________________________________________________")
 X_full = np.concatenate((x_train, x_test), axis=0)
 Y_full = np.concatenate((y_train, y_test), axis=0)
 
+NUM_CLASSES = len(np.unique(Y_full))  # ✅ Dynamic per dataset
+
 X_processed = X_full.reshape(X_full.shape[0], 28, 28, 1).astype('float32') / 255.0
-# Y_onehot = tf.keras.utils.to_categorical(Y_full, NUM_ACTIONS) # REMOVED: Using Prototypes
+# Y_onehot = tf.keras.utils.to_categorical(Y_full, NUM_CLASSES) # REMOVED: Using Prototypes
 
 indices = np.arange(len(X_processed))
 
@@ -612,7 +614,7 @@ proto_manager = PrototypeMappingManager(PROTOTYPE_VECTORS, PROTOTYPE_LUT_PATH)
 # *** NEW: Map Labels to Prototypes ***
 # Get assigned prototypes for this dataset
 assigned_prototypes, class_map = proto_manager.get_prototypes_for_dataset(
-    CURRENT_DATASET_NAME, NUM_ACTIONS
+    CURRENT_DATASET_NAME, NUM_CLASSES
 )
 assigned_prototypes = np.array(assigned_prototypes).astype('float32')
 
@@ -922,7 +924,7 @@ class MultiHopHyperRetriever(Model):
         if self.use_ve_branches:
             # VE needs separate hypernetworks generating weights for Action Dims
             self.ve_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(target_dim, hyper_arch, target_dim), # <-- Changed to target_dim
+                output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim), # <-- Changed to target_dim
                 hop_id=i
             ) for i in range(num_hops)]
             self.ve_hop_target_nets = [DynamicTargetNetwork(
@@ -1631,8 +1633,8 @@ frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
 
 # *** FIXED: Initialize MEM_BANK_VECS placeholder with enough vectors for top_k ***
 # Must have at least NUM_NEIGHBORS vectors to avoid TopKV2 error during dummy pass
-MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
-MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32)) # Changed from LABELS
+MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32))
+MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32)) # Changed from LABELS
 
 # Always build fresh architecture first (for fallback)
 retriever_branch = MultiHopHyperRetriever(
@@ -1640,7 +1642,7 @@ retriever_branch = MultiHopHyperRetriever(
     num_hops=NUM_HOPS, 
     target_dim=EMBEDDING_DIM, 
     hyper_arch=TARGET_NET_ARCH,
-    output_dim=EMBEDDING_DIM,
+    output_dim=PROTOTYPE_DIM,
     initial_temperature=INIT_TEMP
 )
 
@@ -1696,7 +1698,7 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
                     num_hops=NUM_HOPS, 
                     target_dim=EMBEDDING_DIM, 
                     hyper_arch=TARGET_NET_ARCH,
-                    output_dim=EMBEDDING_DIM,
+                    output_dim=PROTOTYPE_DIM,
                     initial_temperature=INIT_TEMP
                 )
         else:
@@ -1862,8 +1864,8 @@ if LTM_EXISTS and existing_count > 0:
 
 else:
     SHOULD_SEED = True
-    MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
-    MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
+    MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32))
+    MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32))
 
 # *** NEW: Use HQE for LTM Encoding if Available ***
 USE_HQE_FOR_LTM_ENCODING = True #Can always be true - LTM_USE_FROZEN_ENCODER_FOR_INSERTION can override
@@ -1921,7 +1923,7 @@ if SHOULD_SEED:
     # Step 3: Group by Label
     print("Grouping candidates by label...")
     label_groups = {}
-    for i in range(NUM_ACTIONS):
+    for i in range(NUM_CLASSES):
         mask = (Y_candidates_int == i)
         label_groups[i] = {
             'vecs': Z_candidates[mask],
@@ -2021,7 +2023,7 @@ if SHOULD_SEED:
     print("\nCollecting and Shuffling Batches Across All Labels...")
     all_batches = []
 
-    for label in range(NUM_ACTIONS):
+    for label in range(NUM_CLASSES):
         group = label_groups[label]
         group_vecs = group['vecs']
         group_labels_int = group['labels_int']
@@ -2154,7 +2156,7 @@ if SHOULD_SEED:
                 k=NUM_NEIGHBORS,
                 hqe_model=hqe_model_for_encoding,
                 raw_images=X_train_val[val_indices],
-                num_classes=NUM_ACTIONS
+                num_classes=NUM_CLASSES
             )
             print(f"  Validation: HQE queries vs {'HQE' if USE_HQE_ENCODING else 'Frozen'} memory")
         else:
@@ -2164,7 +2166,7 @@ if SHOULD_SEED:
                 temp_ltm_vecs_arr, 
                 temp_ltm_protos_arr, 
                 k=NUM_NEIGHBORS,
-                num_classes=NUM_ACTIONS
+                num_classes=NUM_CLASSES
             )
             print(f"  Validation: Frozen queries vs Frozen memory")
         
@@ -3036,12 +3038,6 @@ print(f"Recovered in Pass 3: {total_recovered}")
 if total_wrong_p1 > 0:
     recovery_rate = total_recovered / total_wrong_p1
     print(f"Recovery Rate: {recovery_rate:.2%} of previous errors fixed by Optimized STM")
-
-# Final Comparison
-print("\nRunning Baseline Value Encoder...")
-y_ve_logits = system_model.value_encoder.predict(X_te, verbose=0)
-y_ve_cls = np.argmax(y_ve_logits, axis=1)
-acc_ve = accuracy_score(pass1_trues, y_ve_cls)
 
 print(f"\nFinal Accuracy Comparison:")
 print(f"Value Encoder (Baseline)      : {acc_ve:.4f}")
